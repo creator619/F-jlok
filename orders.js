@@ -12,41 +12,61 @@ router.post("/", (req, res) => {
         return res.status(400).json({ message: "Hiányzó adatok: email vagy kosár tartalom." });
     }
 
-    // 1. Rendelés beszúrása
-    const stmt = db.prepare("INSERT INTO orders (user_email, total_price) VALUES (?, ?)");
-    stmt.run(user_email, total_price, function (err) {
-        if (err) {
-            return res.status(500).json({ message: "Hiba a rendelés mentésekor.", error: err.message });
-        }
-
-        const orderId = this.lastID; // Az új rendelés ID-ja
-
-        // 2. Tételek beszúrása
-        const itemStmt = db.prepare("INSERT INTO order_items (order_id, product_name, price, quantity) VALUES (?, ?, ?, ?)");
-        const stockUpdateStmt = db.prepare("UPDATE product_stock SET stock = stock - ? WHERE product_id = ? AND size = ?");
-
-        db.serialize(() => {
-            db.exec("BEGIN TRANSACTION");
-
-            items.forEach(item => {
-                const qty = item.quantity || 1;
-                itemStmt.run(orderId, item.name, item.price, qty);
-                stockUpdateStmt.run(qty, item.id, item.size);
-            });
-
-            db.exec("COMMIT", (commitErr) => {
-                if (commitErr) {
-                    return res.status(500).json({ message: "Hiba a rendelés véglegesítésekor." });
-                }
-
-                res.status(201).json({ message: "Rendelés sikeresen leadva!", orderId: orderId });
+    // 0. Készlet ellenőrzése
+    const checkStockPromises = items.map(item => {
+        return new Promise((resolve, reject) => {
+            const qty = item.quantity || 1;
+            db.get("SELECT stock FROM product_stock WHERE product_id = ? AND size = ?", [item.id, item.size], (err, row) => {
+                if (err) return reject(new Error("Adatbázis hiba a készlet ellenőrzésekor."));
+                if (!row) return reject(new Error(`A(z) ${item.name} (${item.size}) termék módosult vagy nincs a raktárban.`));
+                if (row.stock < qty) return reject(new Error(`Nincs elég készlet a(z) ${item.name} (${item.size}) termékből! Jelenleg elérhető: ${row.stock} db.`));
+                resolve(true);
             });
         });
-
-        stmt.finalize();
-        itemStmt.finalize();
-        stockUpdateStmt.finalize();
     });
+
+    Promise.all(checkStockPromises)
+        .then(() => {
+            // 1. Rendelés beszúrása
+            const stmt = db.prepare("INSERT INTO orders (user_email, total_price) VALUES (?, ?)");
+            stmt.run(user_email, total_price, function (err) {
+                if (err) {
+                    return res.status(500).json({ message: "Hiba a rendelés mentésekor.", error: err.message });
+                }
+
+                const orderId = this.lastID; // Az új rendelés ID-ja
+
+                // 2. Tételek beszúrása
+                const itemStmt = db.prepare("INSERT INTO order_items (order_id, product_name, price, quantity) VALUES (?, ?, ?, ?)");
+                const stockUpdateStmt = db.prepare("UPDATE product_stock SET stock = stock - ? WHERE product_id = ? AND size = ?");
+
+                db.serialize(() => {
+                    db.exec("BEGIN TRANSACTION");
+
+                    items.forEach(item => {
+                        const qty = item.quantity || 1;
+                        itemStmt.run(orderId, item.name, item.price, qty);
+                        stockUpdateStmt.run(qty, item.id, item.size);
+                    });
+
+                    db.exec("COMMIT", (commitErr) => {
+                        if (commitErr) {
+                            return res.status(500).json({ message: "Hiba a rendelés véglegesítésekor." });
+                        }
+
+                        res.status(201).json({ message: "Rendelés sikeresen leadva!", orderId: orderId });
+                    });
+                });
+
+                stmt.finalize();
+                itemStmt.finalize();
+                stockUpdateStmt.finalize();
+            });
+        })
+        .catch(err => {
+            // Ha valamelyik termékből nincs elég, visszaküldjük a hibát a 400-as kóddal
+            return res.status(400).json({ message: err.message });
+        });
 });
 
 router.get("/my", authMiddleware, (req, res) => {
